@@ -1,4 +1,3 @@
-from typing import Any
 import asyncio
 import json
 import os
@@ -574,10 +573,8 @@ def _export_to_pdf(pptx_path: str, output_path: str | None = None) -> str:
 
     if output_path:
         out_dir = str(Path(output_path).parent)
-        target_name = Path(output_path).stem
     else:
         out_dir = str(path.parent)
-        target_name = path.stem
 
     # Run LibreOffice conversion
     result = subprocess.run(

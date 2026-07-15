@@ -3,7 +3,6 @@
 from dataclasses import dataclass, field
 from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
 
 
 @dataclass
