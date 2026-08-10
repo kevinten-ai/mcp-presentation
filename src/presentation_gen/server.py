@@ -3,8 +3,10 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import BinaryIO, Callable
 
 from mcp.server.models import InitializationOptions
 import mcp.types as types
@@ -30,6 +32,12 @@ from .templates import (
 
 # ── Configuration ────────────────────────────────────────────────────────────
 OUTPUT_DIR = os.getenv("PRESENTATION_OUTPUT_DIR", os.path.join(os.getcwd(), "output"))
+MAX_CONTENT_SLIDES = 100
+MAX_TITLE_CHARS = 1_000
+MAX_CONTENT_CHARS = 20_000
+MAX_PATH_CHARS = 4_096
+MIN_THUMBNAIL_WIDTH = 64
+MAX_THUMBNAIL_WIDTH = 4_096
 
 # ── Resource content ─────────────────────────────────────────────────────────
 TEMPLATE_GUIDE = """# Presentation Template Guide
@@ -94,7 +102,10 @@ TOOLS_GUIDE = """# Presentation Tools Guide
 ## Output
 
 All files are saved to the configured output directory (default: `./output/`).
-Files are timestamped to avoid collisions: `presentation_20260331_143022.pptx`.
+Files are timestamped to avoid collisions: `presentation_20260331_143022_123456.pptx`.
+Custom output paths must use the matching `.pptx`, `.pdf`, or `.png` extension and
+must not already exist. A presentation may contain at most 100 content slides, and
+thumbnail width must be between 64 and 4096 pixels.
 """
 
 # ── Server ───────────────────────────────────────────────────────────────────
@@ -102,6 +113,7 @@ server = Server("mcp-presentation")
 
 
 # ── Slide building helpers ───────────────────────────────────────────────────
+
 
 def _apply_background(slide, style: TemplateStyle) -> None:
     """Apply background color or gradient to a slide."""
@@ -161,11 +173,14 @@ def _add_text_box(
         pass
 
     # Set vertical anchor on the text frame
-    txBox.text_frame._txBody.bodyPr.set("anchor", {
-        MSO_ANCHOR.TOP: "t",
-        MSO_ANCHOR.MIDDLE: "ctr",
-        MSO_ANCHOR.BOTTOM: "b",
-    }.get(vertical_anchor, "t"))
+    txBox.text_frame._txBody.bodyPr.set(
+        "anchor",
+        {
+            MSO_ANCHOR.TOP: "t",
+            MSO_ANCHOR.MIDDLE: "ctr",
+            MSO_ANCHOR.BOTTOM: "b",
+        }.get(vertical_anchor, "t"),
+    )
 
     # Parse content: support newlines as separate paragraphs (bullet points)
     lines = text.split("\n") if text else [""]
@@ -276,7 +291,8 @@ def _build_title_only(slide, slide_data: dict, style: TemplateStyle) -> None:
         height=Inches(2.5),
         font_name=style.title_font,
         font_size=Pt(48),
-        font_color=style.title_color if style.has_header_bar or style.has_gradient_bg
+        font_color=style.title_color
+        if style.has_header_bar or style.has_gradient_bg
         else style.title_color,
         bold=style.title_bold,
         alignment=PP_ALIGN.CENTER,
@@ -471,7 +487,85 @@ LAYOUT_BUILDERS = {
 }
 
 
-def _add_slide_to_prs(prs: Presentation, slide_data: dict, style: TemplateStyle) -> None:
+def _validate_text(
+    value: object, field: str, maximum: int, *, required: bool = False
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    if required and not value.strip():
+        raise ValueError(f"{field} must not be empty")
+    if len(value) > maximum:
+        raise ValueError(f"{field} must be at most {maximum} characters")
+    return value
+
+
+def _validate_slides(slides: object) -> list[dict]:
+    if not isinstance(slides, list):
+        raise ValueError("slides must be an array")
+    if len(slides) > MAX_CONTENT_SLIDES:
+        raise ValueError(f"slides must contain at most {MAX_CONTENT_SLIDES} items")
+
+    for index, slide in enumerate(slides):
+        if not isinstance(slide, dict):
+            raise ValueError(f"slides[{index}] must be an object")
+        _validate_text(
+            slide.get("title", ""), f"slides[{index}].title", MAX_TITLE_CHARS
+        )
+        _validate_text(
+            slide.get("content", ""), f"slides[{index}].content", MAX_CONTENT_CHARS
+        )
+        layout = slide.get("layout", "title_and_content")
+        if layout not in LAYOUT_BUILDERS:
+            raise ValueError(f"slides[{index}].layout is not supported: {layout}")
+        image_path = slide.get("image_path")
+        if image_path is not None:
+            _validate_text(image_path, f"slides[{index}].image_path", MAX_PATH_CHARS)
+    return slides
+
+
+def _validate_pptx_path(value: str) -> Path:
+    path = Path(_validate_text(value, "pptx_path", MAX_PATH_CHARS, required=True))
+    if path.suffix.lower() != ".pptx":
+        raise ValueError("pptx_path must use the .pptx extension")
+    if not path.is_file():
+        raise FileNotFoundError(f"Presentation not found: {value}")
+    return path
+
+
+def _new_output_path(output_path: str | None, suffix: str, prefix: str) -> Path:
+    if output_path is not None:
+        filepath = Path(
+            _validate_text(output_path, "output_path", MAX_PATH_CHARS, required=True)
+        )
+    else:
+        output_dir = Path(OUTPUT_DIR)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filepath = output_dir / f"{prefix}_{timestamp}{suffix}"
+
+    if filepath.suffix.lower() != suffix:
+        raise ValueError(f"output_path must use the {suffix} extension")
+    if filepath.exists():
+        raise FileExistsError(f"Output file already exists: {filepath}")
+    return filepath
+
+
+def _write_new_file(filepath: Path, writer: Callable[[BinaryIO], None]) -> None:
+    """Write a new file without overwriting one created by another process."""
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    created = False
+    try:
+        with filepath.open("xb") as output_file:
+            created = True
+            writer(output_file)
+    except Exception:
+        if created:
+            filepath.unlink(missing_ok=True)
+        raise
+
+
+def _add_slide_to_prs(
+    prs: Presentation, slide_data: dict, style: TemplateStyle
+) -> None:
     """Add a single slide to a Presentation object using the specified layout and style."""
     layout_name = slide_data.get("layout", "title_and_content")
     builder = LAYOUT_BUILDERS.get(layout_name, _build_title_and_content)
@@ -490,6 +584,9 @@ def _create_presentation(
     output_path: str | None = None,
 ) -> str:
     """Create a complete PowerPoint presentation and save to disk."""
+    _validate_text(title, "title", MAX_TITLE_CHARS, required=True)
+    slides = _validate_slides(slides)
+    filepath = _new_output_path(output_path, ".pptx", "presentation")
     style = get_template(template)
 
     prs = Presentation()
@@ -504,17 +601,7 @@ def _create_presentation(
     for slide_data in slides:
         _add_slide_to_prs(prs, slide_data, style)
 
-    # Determine output path
-    if output_path:
-        filepath = Path(output_path)
-    else:
-        output_dir = Path(OUTPUT_DIR)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = output_dir / f"presentation_{timestamp}.pptx"
-
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    prs.save(str(filepath))
+    _write_new_file(filepath, prs.save)
     return str(filepath)
 
 
@@ -527,11 +614,19 @@ def _add_slide_to_existing(
     template: str = "minimal",
 ) -> str:
     """Add a single slide to an existing presentation."""
-    path = Path(pptx_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Presentation not found: {pptx_path}")
+    path = _validate_pptx_path(pptx_path)
+    _validate_text(title, "title", MAX_TITLE_CHARS, required=True)
+    _validate_text(content, "content", MAX_CONTENT_CHARS)
+    if image_path is not None:
+        _validate_text(image_path, "image_path", MAX_PATH_CHARS)
+    if layout not in LAYOUT_BUILDERS:
+        raise ValueError(f"layout is not supported: {layout}")
 
     prs = Presentation(str(path))
+    if len(prs.slides) >= MAX_CONTENT_SLIDES + 1:
+        raise ValueError(
+            f"presentation must contain at most {MAX_CONTENT_SLIDES + 1} slides"
+        )
     # Try to detect template from existing slides, default to provided
     style = get_template(template)
 
@@ -550,9 +645,12 @@ def _add_slide_to_existing(
 
 def _export_to_pdf(pptx_path: str, output_path: str | None = None) -> str:
     """Convert PPTX to PDF using LibreOffice CLI."""
-    path = Path(pptx_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Presentation not found: {pptx_path}")
+    path = _validate_pptx_path(pptx_path)
+    target = _new_output_path(
+        output_path if output_path is not None else str(path.with_suffix(".pdf")),
+        ".pdf",
+        "presentation",
+    )
 
     # Check for LibreOffice
     soffice = shutil.which("soffice")
@@ -571,30 +669,39 @@ def _export_to_pdf(pptx_path: str, output_path: str | None = None) -> str:
             "  Windows: Download from https://www.libreoffice.org/download/"
         )
 
-    if output_path:
-        out_dir = str(Path(output_path).parent)
-    else:
-        out_dir = str(path.parent)
+    with tempfile.TemporaryDirectory(prefix="mcp-presentation-") as temporary_dir:
+        result = subprocess.run(
+            [
+                soffice,
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                temporary_dir,
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
 
-    # Run LibreOffice conversion
-    result = subprocess.run(
-        [soffice, "--headless", "--convert-to", "pdf", "--outdir", out_dir, str(path)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "unknown error").strip()[
+                :2_000
+            ]
+            raise RuntimeError(f"LibreOffice conversion failed: {details}")
 
-    if result.returncode != 0:
-        raise RuntimeError(f"LibreOffice conversion failed: {result.stderr}")
+        generated_pdf = Path(temporary_dir) / f"{path.stem}.pdf"
+        if not generated_pdf.is_file():
+            raise RuntimeError("LibreOffice conversion failed: no PDF was produced")
 
-    # LibreOffice outputs to same directory with .pdf extension
-    generated_pdf = Path(out_dir) / f"{path.stem}.pdf"
+        with generated_pdf.open("rb") as generated_file:
+            _write_new_file(
+                target,
+                lambda output_file: shutil.copyfileobj(generated_file, output_file),
+            )
 
-    if output_path and str(generated_pdf) != output_path:
-        generated_pdf.rename(output_path)
-        return output_path
-
-    return str(generated_pdf)
+    return str(target)
 
 
 def _create_thumbnail(
@@ -603,9 +710,14 @@ def _create_thumbnail(
     output_path: str | None = None,
 ) -> str:
     """Generate a thumbnail image from the first slide of a PPTX."""
-    path = Path(pptx_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Presentation not found: {pptx_path}")
+    path = _validate_pptx_path(pptx_path)
+    if isinstance(width, bool) or not isinstance(width, int):
+        raise ValueError("width must be an integer")
+    if not MIN_THUMBNAIL_WIDTH <= width <= MAX_THUMBNAIL_WIDTH:
+        raise ValueError(
+            f"width must be between {MIN_THUMBNAIL_WIDTH} and {MAX_THUMBNAIL_WIDTH} pixels"
+        )
+    filepath = _new_output_path(output_path, ".png", "thumbnail")
 
     prs = Presentation(str(path))
     if len(prs.slides) == 0:
@@ -668,6 +780,7 @@ def _create_thumbnail(
             try:
                 image_blob = shape.image.blob
                 from io import BytesIO
+
                 pic = Image.open(BytesIO(image_blob))
                 pic = pic.resize((right - left, bottom - top), Image.LANCZOS)
                 img.paste(pic, (left, top))
@@ -695,17 +808,26 @@ def _create_thumbnail(
 
                 # Try to load a decent font, fall back to default
                 try:
-                    font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", pixel_size)
+                    font = ImageFont.truetype(
+                        "/System/Library/Fonts/Helvetica.ttc", pixel_size
+                    )
                 except Exception:
                     try:
-                        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", pixel_size)
+                        font = ImageFont.truetype(
+                            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                            pixel_size,
+                        )
                     except Exception:
                         font = ImageFont.load_default()
 
                 # Get text color
                 text_color = (51, 51, 51)  # default dark gray
                 try:
-                    if paragraph.font and paragraph.font.color and paragraph.font.color.rgb:
+                    if (
+                        paragraph.font
+                        and paragraph.font.color
+                        and paragraph.font.color.rgb
+                    ):
                         rgb = paragraph.font.color.rgb
                         text_color = (rgb[0], rgb[1], rgb[2])
                     elif len(paragraph.runs) > 0:
@@ -735,21 +857,12 @@ def _create_thumbnail(
                 draw.text((x, y_offset), text, fill=text_color, font=font)
                 y_offset += text_h + 8
 
-    # Save
-    if output_path:
-        filepath = Path(output_path)
-    else:
-        output_dir = Path(OUTPUT_DIR)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = output_dir / f"thumbnail_{timestamp}.png"
-
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    img.save(str(filepath), "PNG")
+    _write_new_file(filepath, lambda output_file: img.save(output_file, "PNG"))
     return str(filepath)
 
 
 # ── Resources ────────────────────────────────────────────────────────────────
+
 
 @server.list_resources()
 async def handle_list_resources() -> list[types.Resource]:
@@ -781,6 +894,7 @@ async def handle_read_resource(uri: types.AnyUrl) -> str:
 
 # ── Tools ────────────────────────────────────────────────────────────────────
 
+
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
     template_names = list(TEMPLATES.keys())
@@ -801,9 +915,13 @@ async def handle_list_tools() -> list[types.Tool]:
                     "title": {
                         "type": "string",
                         "description": "Presentation title (shown on the first title slide)",
+                        "minLength": 1,
+                        "maxLength": MAX_TITLE_CHARS,
                     },
                     "slides": {
                         "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_CONTENT_SLIDES,
                         "description": (
                             "Array of slide objects. Each slide: "
                             '{"title": "...", "content": "...", "image_path": "..." (optional), '
@@ -812,9 +930,21 @@ async def handle_list_tools() -> list[types.Tool]:
                         "items": {
                             "type": "object",
                             "properties": {
-                                "title": {"type": "string", "description": "Slide title"},
-                                "content": {"type": "string", "description": "Slide body text. Use \\n for bullet points. For two_column layout, use | to separate columns."},
-                                "image_path": {"type": "string", "description": "Path to an image file (optional)"},
+                                "title": {
+                                    "type": "string",
+                                    "maxLength": MAX_TITLE_CHARS,
+                                    "description": "Slide title",
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "maxLength": MAX_CONTENT_CHARS,
+                                    "description": "Slide body text. Use \\n for bullet points. For two_column layout, use | to separate columns.",
+                                },
+                                "image_path": {
+                                    "type": "string",
+                                    "maxLength": MAX_PATH_CHARS,
+                                    "description": "Path to an image file (optional)",
+                                },
                                 "layout": {
                                     "type": "string",
                                     "description": "Slide layout",
@@ -833,6 +963,7 @@ async def handle_list_tools() -> list[types.Tool]:
                     },
                     "output_path": {
                         "type": "string",
+                        "maxLength": MAX_PATH_CHARS,
                         "description": "Custom output file path (optional, defaults to output/ directory with timestamp)",
                     },
                 },
@@ -850,18 +981,23 @@ async def handle_list_tools() -> list[types.Tool]:
                 "properties": {
                     "pptx_path": {
                         "type": "string",
+                        "maxLength": MAX_PATH_CHARS,
                         "description": "Path to the existing .pptx file",
                     },
                     "title": {
                         "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_TITLE_CHARS,
                         "description": "Slide title",
                     },
                     "content": {
                         "type": "string",
+                        "maxLength": MAX_CONTENT_CHARS,
                         "description": "Slide body text (optional). Use \\n for bullet points.",
                     },
                     "image_path": {
                         "type": "string",
+                        "maxLength": MAX_PATH_CHARS,
                         "description": "Path to an image file (optional)",
                     },
                     "layout": {
@@ -885,10 +1021,12 @@ async def handle_list_tools() -> list[types.Tool]:
                 "properties": {
                     "pptx_path": {
                         "type": "string",
+                        "maxLength": MAX_PATH_CHARS,
                         "description": "Path to the .pptx file to convert",
                     },
                     "output_path": {
                         "type": "string",
+                        "maxLength": MAX_PATH_CHARS,
                         "description": "Custom output PDF path (optional, defaults to same directory as input)",
                     },
                 },
@@ -906,15 +1044,19 @@ async def handle_list_tools() -> list[types.Tool]:
                 "properties": {
                     "pptx_path": {
                         "type": "string",
+                        "maxLength": MAX_PATH_CHARS,
                         "description": "Path to the .pptx file",
                     },
                     "width": {
                         "type": "integer",
                         "description": "Thumbnail width in pixels (default 1280, height auto-calculated from 16:9)",
                         "default": 1280,
+                        "minimum": MIN_THUMBNAIL_WIDTH,
+                        "maximum": MAX_THUMBNAIL_WIDTH,
                     },
                     "output_path": {
                         "type": "string",
+                        "maxLength": MAX_PATH_CHARS,
                         "description": "Custom output PNG path (optional, defaults to output/ directory with timestamp)",
                     },
                 },
@@ -935,16 +1077,24 @@ async def handle_call_tool(
         title = arguments.get("title")
         slides = arguments.get("slides")
         if not title:
-            return [types.TextContent(type="text", text="Missing required parameter: title")]
+            return [
+                types.TextContent(type="text", text="Missing required parameter: title")
+            ]
         if not slides:
-            return [types.TextContent(type="text", text="Missing required parameter: slides")]
+            return [
+                types.TextContent(
+                    type="text", text="Missing required parameter: slides"
+                )
+            ]
 
         # Parse slides if passed as string
         if isinstance(slides, str):
             try:
                 slides = json.loads(slides)
             except json.JSONDecodeError as e:
-                return [types.TextContent(type="text", text=f"Invalid slides JSON: {e}")]
+                return [
+                    types.TextContent(type="text", text=f"Invalid slides JSON: {e}")
+                ]
 
         template = arguments.get("template", "minimal")
         output_path = arguments.get("output_path")
@@ -952,38 +1102,52 @@ async def handle_call_tool(
         try:
             filepath = _create_presentation(title, slides, template, output_path)
             slide_count = len(slides) + 1  # +1 for auto-generated title slide
-            return [types.TextContent(
-                type="text",
-                text=f"Presentation created successfully!\n"
-                     f"  File: {filepath}\n"
-                     f"  Slides: {slide_count}\n"
-                     f"  Template: {template}",
-            )]
+            return [
+                types.TextContent(
+                    type="text",
+                    text=f"Presentation created successfully!\n"
+                    f"  File: {filepath}\n"
+                    f"  Slides: {slide_count}\n"
+                    f"  Template: {template}",
+                )
+            ]
         except Exception as e:
-            return [types.TextContent(type="text", text=f"Error creating presentation: {e}")]
+            return [
+                types.TextContent(type="text", text=f"Error creating presentation: {e}")
+            ]
 
     if name == "add_slide":
         pptx_path = arguments.get("pptx_path")
         title = arguments.get("title")
         if not pptx_path:
-            return [types.TextContent(type="text", text="Missing required parameter: pptx_path")]
+            return [
+                types.TextContent(
+                    type="text", text="Missing required parameter: pptx_path"
+                )
+            ]
         if not title:
-            return [types.TextContent(type="text", text="Missing required parameter: title")]
+            return [
+                types.TextContent(type="text", text="Missing required parameter: title")
+            ]
 
         content = arguments.get("content", "")
         image_path = arguments.get("image_path")
         layout = arguments.get("layout", "title_and_content")
 
         try:
-            filepath = _add_slide_to_existing(pptx_path, title, content, image_path, layout)
+            filepath = _add_slide_to_existing(
+                pptx_path, title, content, image_path, layout
+            )
             prs = Presentation(filepath)
             total = len(prs.slides)
-            return [types.TextContent(
-                type="text",
-                text=f"Slide added successfully!\n"
-                     f"  File: {filepath}\n"
-                     f"  Total slides: {total}",
-            )]
+            return [
+                types.TextContent(
+                    type="text",
+                    text=f"Slide added successfully!\n"
+                    f"  File: {filepath}\n"
+                    f"  Total slides: {total}",
+                )
+            ]
         except FileNotFoundError as e:
             return [types.TextContent(type="text", text=str(e))]
         except Exception as e:
@@ -992,16 +1156,22 @@ async def handle_call_tool(
     if name == "export_to_pdf":
         pptx_path = arguments.get("pptx_path")
         if not pptx_path:
-            return [types.TextContent(type="text", text="Missing required parameter: pptx_path")]
+            return [
+                types.TextContent(
+                    type="text", text="Missing required parameter: pptx_path"
+                )
+            ]
 
         output_path = arguments.get("output_path")
 
         try:
             filepath = _export_to_pdf(pptx_path, output_path)
-            return [types.TextContent(
-                type="text",
-                text=f"PDF exported successfully!\n  File: {filepath}",
-            )]
+            return [
+                types.TextContent(
+                    type="text",
+                    text=f"PDF exported successfully!\n  File: {filepath}",
+                )
+            ]
         except FileNotFoundError as e:
             return [types.TextContent(type="text", text=str(e))]
         except RuntimeError as e:
@@ -1012,25 +1182,33 @@ async def handle_call_tool(
     if name == "create_thumbnail":
         pptx_path = arguments.get("pptx_path")
         if not pptx_path:
-            return [types.TextContent(type="text", text="Missing required parameter: pptx_path")]
+            return [
+                types.TextContent(
+                    type="text", text="Missing required parameter: pptx_path"
+                )
+            ]
 
         width = arguments.get("width", 1280)
         output_path = arguments.get("output_path")
 
         try:
             filepath = _create_thumbnail(pptx_path, width, output_path)
-            return [types.TextContent(
-                type="text",
-                text=f"Thumbnail created successfully!\n"
-                     f"  File: {filepath}\n"
-                     f"  Width: {width}px",
-            )]
+            return [
+                types.TextContent(
+                    type="text",
+                    text=f"Thumbnail created successfully!\n"
+                    f"  File: {filepath}\n"
+                    f"  Width: {width}px",
+                )
+            ]
         except FileNotFoundError as e:
             return [types.TextContent(type="text", text=str(e))]
         except ValueError as e:
             return [types.TextContent(type="text", text=str(e))]
         except Exception as e:
-            return [types.TextContent(type="text", text=f"Error creating thumbnail: {e}")]
+            return [
+                types.TextContent(type="text", text=f"Error creating thumbnail: {e}")
+            ]
 
     return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
 

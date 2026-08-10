@@ -16,7 +16,10 @@ MCP server for AI-assisted presentation generation. Four tools: `create_slides`,
 - Slides are built on blank layouts using `python-pptx` shapes (textboxes, rectangles, images) for full control
 - `two_column` layout uses `|` as column separator in the content string
 - PDF export delegates to LibreOffice CLI (`soffice --headless`), returns clear install instructions if not available
+- PDF conversion runs in an isolated temporary directory before moving a new file to the requested destination
 - Thumbnail rendering uses Pillow to draw a simplified version of the first slide
+- Custom outputs require the format-specific extension and never overwrite existing files; `add_slide` remains intentionally in-place
+- Resource limits: 100 content slides and thumbnail widths from 64 to 4096 pixels
 
 ## Development
 
@@ -31,3 +34,4 @@ uv run presentation-gen    # run server
 - `image_full` layout requires a valid local file path for the image — remote URLs are not supported
 - The `slides` parameter in `create_slides` can be a JSON array or a JSON string (auto-parsed)
 - `create_thumbnail` is an approximation — complex shapes/gradients may not render perfectly
+- Image/video generation belongs to AnyCap CLI; the image/video MCP projects are compatibility-only
