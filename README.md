@@ -26,7 +26,9 @@
 - **PDF export** — one-click conversion via LibreOffice
 - **Thumbnail preview** — render first slide as PNG
 - **Built-in guides** — MCP Resources with template docs and usage tips
-- Auto-save with timestamps to output directory
+- Auto-save with microsecond timestamps to avoid filename collisions
+- Safe custom outputs — matching extensions required; existing files are never overwritten
+- Resource limits — up to 100 content slides and thumbnail widths from 64 to 4096 pixels
 
 ## Architecture
 
@@ -201,7 +203,10 @@ The server exposes built-in documentation that AI assistants can automatically r
 --env PRESENTATION_OUTPUT_DIR=/absolute/path/to/your/presentations
 ```
 
-Files are saved with timestamps: `presentation_20260331_143022.pptx`.
+Files are saved with microsecond timestamps: `presentation_20260331_143022_123456.pptx`.
+Custom output paths must end in the format-specific extension (`.pptx`, `.pdf`, or
+`.png`) and point to a file that does not already exist. `add_slide` is the only
+in-place operation and intentionally updates the supplied `.pptx` file.
 
 ## Troubleshooting
 
@@ -213,6 +218,9 @@ Files are saved with timestamps: `presentation_20260331_143022.pptx`.
 | `Missing required parameter: slides` | No slides array provided | Pass a `slides` array of slide objects |
 | `Presentation not found` | Invalid pptx_path | Check the file path exists |
 | `Invalid slides JSON` | Malformed slides array | Ensure slides is a valid JSON array |
+| `Output file already exists` | A custom or default target would overwrite a file | Choose a new output path or remove the old file explicitly |
+| `output_path must use...` | Output extension does not match the generated format | Use `.pptx`, `.pdf`, or `.png` as required |
+| `slides must contain at most 100 items` | Deck request is too large | Split it into smaller presentations |
 
 ### PDF Export Errors
 
@@ -253,11 +261,13 @@ uv run presentation-gen
 npx @modelcontextprotocol/inspector uv --directory /path/to/mcp-presentation run presentation-gen
 ```
 
-## Related Projects
+## Related Media Workflow
 
-- [mcp-image-gen](https://github.com/kevinten-ai/mcp-image-gen) — AI image generation MCP server (Gemini + Imagen)
-- [mcp-video-gen](https://github.com/kevinten-ai/mcp-video-gen) — Multi-provider AI video generation MCP server
-- [mcp-3d-gen](https://github.com/kevinten-ai/mcp-3d-gen) — AI 3D model generation MCP server
+Use AnyCap CLI as the default entry point for image generation, image editing, and
+video generation. `mcp-image-gen` and `mcp-video-gen` are retained only for MCP
+compatibility and protocol testing; they are not the recommended daily generation path.
+This server remains appropriate for local PPTX/PDF/thumbnail operations inside an
+agent workflow.
 
 ## License
 

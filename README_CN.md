@@ -26,7 +26,9 @@
 - **PDF 导出** — 通过 LibreOffice 一键转换
 - **缩略图预览** — 将首页幻灯片渲染为 PNG 图片
 - **内置指南** — MCP Resources 提供模板文档和使用技巧
-- 自动时间戳命名保存到输出目录
+- 使用微秒级时间戳自动命名，避免文件名碰撞
+- 安全的自定义输出：扩展名必须匹配，且绝不覆盖已有文件
+- 资源上限：最多 100 张内容页，缩略图宽度范围为 64–4096 像素
 
 ## 架构
 
@@ -201,7 +203,9 @@ create_thumbnail(pptx_path="/path/to/presentation.pptx", width=1280)
 --env PRESENTATION_OUTPUT_DIR=/你的/演示文稿/保存/路径
 ```
 
-文件以时间戳命名保存：`presentation_20260331_143022.pptx`。
+文件以微秒级时间戳命名保存：`presentation_20260331_143022_123456.pptx`。
+自定义输出路径必须使用对应格式的扩展名（`.pptx`、`.pdf` 或 `.png`），
+并且目标文件不能已经存在。`add_slide` 是唯一的原位修改操作，会按设计更新传入的 `.pptx` 文件。
 
 ## 常见问题排查
 
@@ -213,6 +217,9 @@ create_thumbnail(pptx_path="/path/to/presentation.pptx", width=1280)
 | `Missing required parameter: slides` | 未提供幻灯片数组 | 传入 `slides` 幻灯片对象数组 |
 | `Presentation not found` | pptx_path 路径无效 | 检查文件路径是否存在 |
 | `Invalid slides JSON` | 幻灯片数组格式错误 | 确保 slides 是有效的 JSON 数组 |
+| `Output file already exists` | 输出会覆盖已有文件 | 选择新路径，或由用户明确删除旧文件 |
+| `output_path must use...` | 输出扩展名与生成格式不符 | 按工具使用 `.pptx`、`.pdf` 或 `.png` |
+| `slides must contain at most 100 items` | 单次演示文稿过大 | 拆分为多个演示文稿 |
 
 ### PDF 导出错误
 
@@ -253,11 +260,11 @@ uv run presentation-gen
 npx @modelcontextprotocol/inspector uv --directory /path/to/mcp-presentation run presentation-gen
 ```
 
-## 相关项目
+## 相关媒体工作流
 
-- [mcp-image-gen](https://github.com/kevinten-ai/mcp-image-gen) — AI 图片生成 MCP 服务器（Gemini + Imagen）
-- [mcp-video-gen](https://github.com/kevinten-ai/mcp-video-gen) — 多平台 AI 视频生成 MCP 服务器
-- [mcp-3d-gen](https://github.com/kevinten-ai/mcp-3d-gen) — AI 3D 模型生成 MCP 服务器
+图片生成、图片编辑和视频生成默认使用 AnyCap CLI。`mcp-image-gen` 与
+`mcp-video-gen` 仅保留用于 MCP 兼容性和协议测试，不作为日常生成入口。
+本服务器继续负责代理工作流中的本地 PPTX、PDF 和缩略图操作。
 
 ## 许可证
 
